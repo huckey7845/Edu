@@ -1,0 +1,101 @@
+name: Validate Bedrock resource packs
+
+on:
+  push:
+    paths:
+      - "**/*.mcpack"
+      - "**/*.zip"
+      - "**/manifest.json"
+      - "**/*.json"
+      - ".github/workflows/validate-pack.yml"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Validate pack files
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, pathlib, sys, zipfile
+          roots = []
+          for path in pathlib.Path(".").rglob("manifest.json"):
+              if ".git" not in path.parts and "node_modules" not in path.parts:
+                  roots.append(path.parent)
+          archives = list(pathlib.Path(".").rglob("*.mcpack")) + list(pathlib.Path(".").rglob("*.zip"))
+          errors = []
+          checked = 0
+
+          def check_manifest(data, label):
+              global checked
+              checked += 1
+              header = data.get("header", {})
+              modules = data.get("modules", [])
+              for field in ("name", "description", "uuid", "version"):
+                  if field not in header:
+                      errors.append(f"{label}: manifest header missing {field}")
+              try:
+                  import uuid
+                  uuid.UUID(header.get("uuid", ""))
+              except Exception:
+                  errors.append(f"{label}: invalid header UUID")
+              if not isinstance(header.get("version"), list) or len(header["version"]) != 3:
+                  errors.append(f"{label}: header version must be [major, minor, patch]")
+              seen = set()
+              for module in modules:
+                  try:
+                      uuid.UUID(module.get("uuid", ""))
+                  except Exception:
+                      errors.append(f"{label}: invalid module UUID")
+                  value = module.get("uuid")
+                  if value in seen or value == header.get("uuid"):
+                      errors.append(f"{label}: duplicate UUID {value}")
+                  seen.add(value)
+                  if not isinstance(module.get("version"), list) or len(module["version"]) != 3:
+                      errors.append(f"{label}: module version must be [major, minor, patch]")
+
+          for root in roots:
+              try:
+                  manifest = json.loads((root / "manifest.json").read_text())
+                  check_manifest(manifest, str(root))
+              except Exception as exc:
+                  errors.append(f"{root}: {exc}")
+              for file in root.rglob("*.json"):
+                  try:
+                      json.loads(file.read_text())
+                  except Exception as exc:
+                      errors.append(f"{file}: invalid JSON: {exc}")
+
+          for archive in archives:
+              try:
+                  with zipfile.ZipFile(archive) as z:
+                      names = set(z.namelist())
+                      manifest_name = "manifest.json"
+                      if manifest_name not in names:
+                          errors.append(f"{archive}: manifest.json must be at archive root")
+                          continue
+                      check_manifest(json.loads(z.read(manifest_name)), str(archive))
+                      for name in names:
+                          if name.endswith(".json"):
+                              try:
+                                  json.loads(z.read(name))
+                              except Exception as exc:
+                                  errors.append(f"{archive}:{name}: invalid JSON: {exc}")
+              except Exception as exc:
+                  errors.append(f"{archive}: unreadable archive: {exc}")
+
+          if checked == 0:
+              print("No resource pack found yet; structural checks will run when a pack is added.")
+          if errors:
+              print("\n".join("ERROR: " + e for e in errors))
+              sys.exit(1)
+          print(f"Validation passed. Checked {checked} manifest(s).")
+          PY
